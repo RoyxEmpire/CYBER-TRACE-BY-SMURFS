@@ -1,0 +1,302 @@
+"""
+SMURF — Standalone Geospatial Intelligence Map
+===============================================
+Complete, working map module for scammer location tracking.
+Run with: streamlit run map_standalone.py
+"""
+
+import streamlit as st
+import pandas as pd
+import folium
+from folium.plugins import MarkerCluster, HeatMap
+from streamlit_folium import st_folium
+import os
+
+# Page config
+st.set_page_config(
+    page_title="SMURF | Geospatial Intelligence",
+    page_icon="🗺️",
+    layout="wide"
+)
+
+# Custom CSS
+st.markdown("""
+<style>
+    .stApp {
+        background: linear-gradient(180deg, #0b1220 0%, #0f1a2e 100%);
+        color: #e2e8f0;
+    }
+    .stMetric {
+        background: rgba(30, 41, 59, 0.7);
+        padding: 1rem;
+        border-radius: 10px;
+        border: 1px solid rgba(148, 163, 184, 0.1);
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Risk color mapping
+def get_risk_color(score):
+    if score >= 7: return "#dc2626"  # Critical - Red
+    if score >= 5: return "#ea580c"  # High - Orange
+    if score >= 3: return "#ca8a04"  # Medium - Yellow
+    return "#16a34a"  # Low - Green
+
+def get_risk_label(score):
+    if score >= 7: return "🔴 CRITICAL"
+    if score >= 5: return "🟠 HIGH"
+    if score >= 3: return "🟡 MEDIUM"
+    return "🟢 LOW"
+
+# Load or generate data
+@st.cache_data
+def load_data():
+    """Load CSV or generate sample data if not found."""
+    csv_path = "synthetic_complaints.csv"
+    
+    if os.path.exists(csv_path):
+        df = pd.read_csv(csv_path)
+        return df
+    
+    # Generate sample data if CSV doesn't exist
+    import random
+    from faker import Faker
+    
+    fake = Faker('en_IN')
+    data = []
+    
+    zone_coordinates = {
+        '600001': {'lat': 13.0827, 'lon': 80.2707},
+        '600028': {'lat': 13.0067, 'lon': 80.2206},
+        '400001': {'lat': 18.9388, 'lon': 72.8354},
+        '110001': {'lat': 28.6139, 'lon': 77.2090},
+        '700001': {'lat': 22.5726, 'lon': 88.3639},
+    }
+    zones = list(zone_coordinates.keys())
+    
+    for i in range(200):  # Generate 200 sample records
+        zone = random.choice(zones)
+        base_lat = zone_coordinates[zone]['lat']
+        base_lon = zone_coordinates[zone]['lon']
+        
+        risk_score = random.randint(0, 10)
+        amount = random.randint(5000, 100000)
+        
+        row = {
+            'complaint_id': f"CMP{i+1000}",
+            'scam_vector': random.choice(['QR Code', 'Phishing URL']),
+            'scam_payload': f"pay{random.randint(10,999)}@ybl" if random.random() > 0.5 else f"https://scam-{random.randint(100,999)}.xyz",
+            'suspect_name': fake.name(),
+            'suspect_phone': f"+91 {random.randint(6000000000, 9999999999)}",
+            'amount': amount,
+            'risk_score': risk_score,
+            'hop_count': random.randint(2, 8),
+            'account_age_days': random.randint(1, 1000),
+            'withdrawal_zone': zone,
+            'latitude': round(base_lat + random.uniform(-0.02, 0.02), 6),
+            'longitude': round(base_lon + random.uniform(-0.02, 0.02), 6),
+        }
+        data.append(row)
+    
+    return pd.DataFrame(data)
+
+# Main app
+def main():
+    st.title("🗺️ SMURF Geospatial Intelligence System")
+    st.markdown("### Precision scammer location tracking with risk-based mapping")
+    
+    # Load data
+    df = load_data()
+    
+    if df.empty:
+        st.error("❌ No data available. Please generate synthetic_complaints.csv first.")
+        return
+    
+    # Sidebar filters
+    with st.sidebar:
+        st.header("🎛️ Map Filters")
+        
+        # Zone filter
+        zones = ["All Zones"] + sorted(df["withdrawal_zone"].unique().tolist())
+        selected_zone = st.selectbox("📍 Withdrawal Zone", zones)
+        
+        # Risk filter
+        risk_levels = ["All Risk Levels", "Critical (7-10)", "High (5-6)", "Medium (3-4)", "Low (0-2)"]
+        selected_risk = st.selectbox("⚠️ Risk Level", risk_levels)
+        
+        # Vector filter
+        vectors = ["All Vectors"] + df["scam_vector"].unique().tolist()
+        selected_vector = st.selectbox("🎯 Scam Vector", vectors)
+        
+        # Map style
+        map_styles = {
+            "Street View": "OpenStreetMap",
+            "Satellite": "Esri World Imagery",
+            "Dark Mode": "CartoDB dark_matter",
+        }
+        selected_style = st.selectbox("🛰️ Map Style", list(map_styles.keys()))
+        
+        # Toggle options
+        show_heatmap = st.checkbox("🔥 Show Heatmap", value=True)
+        show_clusters = st.checkbox("🔗 Cluster Markers", value=True)
+    
+    # Apply filters
+    filtered_df = df.copy()
+    
+    if selected_zone != "All Zones":
+        filtered_df = filtered_df[filtered_df["withdrawal_zone"] == selected_zone]
+    
+    if selected_risk != "All Risk Levels":
+        if "Critical" in selected_risk:
+            filtered_df = filtered_df[filtered_df["risk_score"] >= 7]
+        elif "High" in selected_risk:
+            filtered_df = filtered_df[(filtered_df["risk_score"] >= 5) & (filtered_df["risk_score"] < 7)]
+        elif "Medium" in selected_risk:
+            filtered_df = filtered_df[(filtered_df["risk_score"] >= 3) & (filtered_df["risk_score"] < 5)]
+        elif "Low" in selected_risk:
+            filtered_df = filtered_df[filtered_df["risk_score"] < 3]
+    
+    if selected_vector != "All Vectors":
+        filtered_df = filtered_df[filtered_df["scam_vector"] == selected_vector]
+    
+    st.info(f"📊 Displaying **{len(filtered_df)}** complaints on map")
+    
+    if filtered_df.empty:
+        st.warning("No complaints match the selected filters.")
+        return
+    
+    # Calculate map center
+    center_lat = filtered_df["latitude"].mean()
+    center_lon = filtered_df["longitude"].mean()
+    
+    # Create Folium map
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=11,
+        tiles=map_styles[selected_style],
+        max_zoom=19,
+        min_zoom=4,
+    )
+    
+    # Add heatmap
+    if show_heatmap:
+        heat_data = filtered_df[["latitude", "longitude", "risk_score"]].values.tolist()
+        HeatMap(
+            heat_data,
+            radius=20,
+            blur=15,
+            max_zoom=13,
+            gradient={0.2: "blue", 0.4: "lime", 0.6: "yellow", 0.8: "orange", 1.0: "red"}
+        ).add_to(m)
+    
+    # Add markers
+    if show_clusters:
+        marker_cluster = MarkerCluster().add_to(m)
+        target_layer = marker_cluster
+    else:
+        target_layer = m
+    
+    for _, row in filtered_df.iterrows():
+        risk_color = get_risk_color(row["risk_score"])
+        risk_label = get_risk_label(row["risk_score"])
+        
+        popup_html = f"""
+        <div style="font-family: Arial; width: 280px;">
+            <h4 style="color: {risk_color}; margin: 0 0 10px 0;">
+                {risk_label} — {row['complaint_id']}
+            </h4>
+            <hr style="margin: 5px 0;">
+            <b>🕵️ Suspect:</b> {row.get('suspect_name', 'Unknown')}<br>
+            <b>📞 Phone:</b> {row.get('suspect_phone', 'N/A')}<br>
+            <b>💰 Amount:</b> ₹{row['amount']:,}<br>
+            <b>🎯 Vector:</b> {row['scam_vector']}<br>
+            <b>🔗 Payload:</b> <code style="font-size: 11px;">{row['scam_payload']}</code><br>
+            <b>📍 Zone:</b> {row['withdrawal_zone']}<br>
+            <b>⚠️ Risk Score:</b> {row['risk_score']}/10<br>
+            <b>🔀 Hops:</b> {row['hop_count']} | 
+            <b>📅 Account Age:</b> {row['account_age_days']} days
+        </div>
+        """
+        
+        icon = folium.DivIcon(
+            html=f"""
+            <div style="
+                background-color: {risk_color};
+                width: 20px; height: 20px;
+                border-radius: 50%;
+                border: 3px solid white;
+                box-shadow: 0 0 10px {risk_color};
+            "></div>
+            """,
+            icon_size=(26, 26),
+            icon_anchor=(13, 13),
+        )
+        
+        folium.Marker(
+            location=[row["latitude"], row["longitude"]],
+            popup=folium.Popup(popup_html, max_width=320),
+            tooltip=f"{row['complaint_id']} | ₹{row['amount']:,} | {risk_label}",
+            icon=icon,
+        ).add_to(target_layer)
+    
+    # Add legend
+    legend_html = """
+    <div style="
+        position: fixed; 
+        bottom: 30px; left: 30px; 
+        z-index: 9999;
+        background: white; 
+        padding: 15px; 
+        border-radius: 10px;
+        box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+        font-size: 13px;
+        font-family: Arial;
+    ">
+        <b style="font-size: 14px;">🎯 Risk Legend</b><br><br>
+        <span style="color: #dc2626; font-size: 16px;">●</span> Critical (7-10)<br>
+        <span style="color: #ea580c; font-size: 16px;">●</span> High (5-6)<br>
+        <span style="color: #ca8a04; font-size: 16px;">●</span> Medium (3-4)<br>
+        <span style="color: #16a34a; font-size: 16px;">●</span> Low (0-2)
+    </div>
+    """
+    m.get_root().html.add_child(folium.Element(legend_html))
+    
+    # Render map in Streamlit
+    st_folium(m, width=None, height=650, returned_objects=[])
+    
+    # Statistics section
+    st.divider()
+    st.subheader("📊 Zone Intelligence Summary")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric("🎯 Total Incidents", len(filtered_df))
+    
+    with col2:
+        avg_risk = filtered_df["risk_score"].mean()
+        st.metric("⚠️ Avg Risk Score", f"{avg_risk:.1f}/10")
+    
+    with col3:
+        total_loss = filtered_df["amount"].sum()
+        st.metric("💰 Total Loss", f"₹{total_loss:,.0f}")
+    
+    # Zone breakdown table
+    zone_stats = filtered_df.groupby("withdrawal_zone").agg(
+        incidents=("complaint_id", "count"),
+        avg_risk=("risk_score", "mean"),
+        total_loss=("amount", "sum"),
+    ).round(2).sort_values("incidents", ascending=False)
+    
+    st.dataframe(
+        zone_stats,
+        use_container_width=True,
+        column_config={
+            "incidents": st.column_config.NumberColumn("Incidents", format="%d"),
+            "avg_risk": st.column_config.ProgressColumn("Avg Risk", min_value=0, max_value=10, format="%.1f"),
+            "total_loss": st.column_config.NumberColumn("Total Loss (₹)", format="₹%d"),
+        }
+    )
+
+if __name__ == "__main__":
+    main()
