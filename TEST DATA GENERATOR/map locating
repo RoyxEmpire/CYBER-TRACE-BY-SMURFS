@@ -1,7 +1,7 @@
 """
-SMURF — Standalone Geospatial Intelligence Map
-===============================================
-Complete, working map module for scammer location tracking.
+SMURF — Standalone Geospatial Intelligence Map (v2.0)
+======================================================
+Complete, working map module with Precise Coordinate Search.
 Run with: streamlit run map_standalone.py
 """
 
@@ -11,6 +11,8 @@ import folium
 from folium.plugins import MarkerCluster, HeatMap
 from streamlit_folium import st_folium
 import os
+import random
+from faker import Faker
 
 # Page config
 st.set_page_config(
@@ -31,6 +33,12 @@ st.markdown("""
         padding: 1rem;
         border-radius: 10px;
         border: 1px solid rgba(148, 163, 184, 0.1);
+    }
+    /* Pulsing animation for target marker */
+    @keyframes pulse-red {
+        0% { transform: scale(1); opacity: 1; box-shadow: 0 0 0 0 rgba(255, 0, 0, 0.7); }
+        70% { transform: scale(1.5); opacity: 0; box-shadow: 0 0 0 15px rgba(255, 0, 0, 0); }
+        100% { transform: scale(1); opacity: 0; }
     }
 </style>
 """, unsafe_allow_html=True)
@@ -55,32 +63,25 @@ def load_data():
     csv_path = "synthetic_complaints.csv"
     
     if os.path.exists(csv_path):
-        df = pd.read_csv(csv_path)
-        return df
+        return pd.read_csv(csv_path)
     
     # Generate sample data if CSV doesn't exist
-    import random
-    from faker import Faker
-    
     fake = Faker('en_IN')
     data = []
     
     zone_coordinates = {
-        '600001': {'lat': 13.0827, 'lon': 80.2707},
-        '600028': {'lat': 13.0067, 'lon': 80.2206},
-        '400001': {'lat': 18.9388, 'lon': 72.8354},
-        '110001': {'lat': 28.6139, 'lon': 77.2090},
-        '700001': {'lat': 22.5726, 'lon': 88.3639},
+        '600001': {'lat': 13.0827, 'lon': 80.2707},   # Chennai
+        '600028': {'lat': 13.0067, 'lon': 80.2206},   # Chennai Guindy
+        '400001': {'lat': 18.9388, 'lon': 72.8354},   # Mumbai
+        '110001': {'lat': 28.6139, 'lon': 77.2090},   # Delhi
+        '700001': {'lat': 22.5726, 'lon': 88.3639},   # Kolkata
     }
     zones = list(zone_coordinates.keys())
     
-    for i in range(200):  # Generate 200 sample records
+    for i in range(200):
         zone = random.choice(zones)
         base_lat = zone_coordinates[zone]['lat']
         base_lon = zone_coordinates[zone]['lon']
-        
-        risk_score = random.randint(0, 10)
-        amount = random.randint(5000, 100000)
         
         row = {
             'complaint_id': f"CMP{i+1000}",
@@ -88,8 +89,8 @@ def load_data():
             'scam_payload': f"pay{random.randint(10,999)}@ybl" if random.random() > 0.5 else f"https://scam-{random.randint(100,999)}.xyz",
             'suspect_name': fake.name(),
             'suspect_phone': f"+91 {random.randint(6000000000, 9999999999)}",
-            'amount': amount,
-            'risk_score': risk_score,
+            'amount': random.randint(5000, 100000),
+            'risk_score': random.randint(0, 10),
             'hop_count': random.randint(2, 8),
             'account_age_days': random.randint(1, 1000),
             'withdrawal_zone': zone,
@@ -105,30 +106,56 @@ def main():
     st.title("🗺️ SMURF Geospatial Intelligence System")
     st.markdown("### Precision scammer location tracking with risk-based mapping")
     
-    # Load data
+    # Initialize session state for precise targeting
+    if "target_lat" not in st.session_state:
+        st.session_state.target_lat = None
+    if "target_lon" not in st.session_state:
+        st.session_state.target_lon = None
+
     df = load_data()
     
     if df.empty:
-        st.error("❌ No data available. Please generate synthetic_complaints.csv first.")
+        st.error("❌ No data available.")
         return
     
-    # Sidebar filters
+    # Sidebar filters & NEW Precise Search
     with st.sidebar:
-        st.header("🎛️ Map Filters")
+        st.header("🎛️ Map Controls")
         
-        # Zone filter
+        # --- NEW FEATURE: Precise Coordinate Search ---
+        st.markdown("### 🎯 Precise Location Search")
+        st.caption("Enter exact Lat/Lon to pinpoint a suspect.")
+        col1, col2 = st.columns(2)
+        with col1:
+            input_lat = st.number_input("Latitude", value=13.0827, format="%.6f")
+        with col2:
+            input_lon = st.number_input("Longitude", value=80.2707, format="%.6f")
+            
+        if st.button("📍 Locate Target", type="primary", use_container_width=True):
+            if -90 <= input_lat <= 90 and -180 <= input_lon <= 180:
+                st.session_state.target_lat = input_lat
+                st.session_state.target_lon = input_lon
+                st.success("🎯 Target locked! Map zoomed to street level.")
+            else:
+                st.error("Invalid coordinates!")
+        
+        if st.button("🔄 Reset View", type="secondary", use_container_width=True):
+            st.session_state.target_lat = None
+            st.session_state.target_lon = None
+            st.rerun()
+
+        st.divider()
+        
+        # Standard Filters
         zones = ["All Zones"] + sorted(df["withdrawal_zone"].unique().tolist())
         selected_zone = st.selectbox("📍 Withdrawal Zone", zones)
         
-        # Risk filter
         risk_levels = ["All Risk Levels", "Critical (7-10)", "High (5-6)", "Medium (3-4)", "Low (0-2)"]
         selected_risk = st.selectbox("⚠️ Risk Level", risk_levels)
         
-        # Vector filter
         vectors = ["All Vectors"] + df["scam_vector"].unique().tolist()
         selected_vector = st.selectbox("🎯 Scam Vector", vectors)
         
-        # Map style
         map_styles = {
             "Street View": "OpenStreetMap",
             "Satellite": "Esri World Imagery",
@@ -136,16 +163,13 @@ def main():
         }
         selected_style = st.selectbox("🛰️ Map Style", list(map_styles.keys()))
         
-        # Toggle options
         show_heatmap = st.checkbox("🔥 Show Heatmap", value=True)
         show_clusters = st.checkbox("🔗 Cluster Markers", value=True)
     
     # Apply filters
     filtered_df = df.copy()
-    
     if selected_zone != "All Zones":
         filtered_df = filtered_df[filtered_df["withdrawal_zone"] == selected_zone]
-    
     if selected_risk != "All Risk Levels":
         if "Critical" in selected_risk:
             filtered_df = filtered_df[filtered_df["risk_score"] >= 7]
@@ -155,7 +179,6 @@ def main():
             filtered_df = filtered_df[(filtered_df["risk_score"] >= 3) & (filtered_df["risk_score"] < 5)]
         elif "Low" in selected_risk:
             filtered_df = filtered_df[filtered_df["risk_score"] < 3]
-    
     if selected_vector != "All Vectors":
         filtered_df = filtered_df[filtered_df["scam_vector"] == selected_vector]
     
@@ -165,14 +188,20 @@ def main():
         st.warning("No complaints match the selected filters.")
         return
     
-    # Calculate map center
-    center_lat = filtered_df["latitude"].mean()
-    center_lon = filtered_df["longitude"].mean()
+    # Determine map center and zoom level
+    if st.session_state.target_lat and st.session_state.target_lon:
+        center_lat = st.session_state.target_lat
+        center_lon = st.session_state.target_lon
+        zoom_level = 16  # Street-level precision zoom
+    else:
+        center_lat = filtered_df["latitude"].mean()
+        center_lon = filtered_df["longitude"].mean()
+        zoom_level = 11  # City-level overview zoom
     
     # Create Folium map
     m = folium.Map(
         location=[center_lat, center_lon],
-        zoom_start=11,
+        zoom_start=zoom_level,
         tiles=map_styles[selected_style],
         max_zoom=19,
         min_zoom=4,
@@ -190,7 +219,7 @@ def main():
         ).add_to(m)
     
     # Add markers
-    if show_clusters:
+    if show_clusters and not st.session_state.target_lat:
         marker_cluster = MarkerCluster().add_to(m)
         target_layer = marker_cluster
     else:
@@ -202,9 +231,7 @@ def main():
         
         popup_html = f"""
         <div style="font-family: Arial; width: 280px;">
-            <h4 style="color: {risk_color}; margin: 0 0 10px 0;">
-                {risk_label} — {row['complaint_id']}
-            </h4>
+            <h4 style="color: {risk_color}; margin: 0 0 10px 0;">{risk_label} — {row['complaint_id']}</h4>
             <hr style="margin: 5px 0;">
             <b>🕵️ Suspect:</b> {row.get('suspect_name', 'Unknown')}<br>
             <b>📞 Phone:</b> {row.get('suspect_phone', 'N/A')}<br>
@@ -212,9 +239,7 @@ def main():
             <b>🎯 Vector:</b> {row['scam_vector']}<br>
             <b>🔗 Payload:</b> <code style="font-size: 11px;">{row['scam_payload']}</code><br>
             <b>📍 Zone:</b> {row['withdrawal_zone']}<br>
-            <b>⚠️ Risk Score:</b> {row['risk_score']}/10<br>
-            <b>🔀 Hops:</b> {row['hop_count']} | 
-            <b>📅 Account Age:</b> {row['account_age_days']} days
+            <b>⚠️ Risk Score:</b> {row['risk_score']}/10
         </div>
         """
         
@@ -239,18 +264,48 @@ def main():
             icon=icon,
         ).add_to(target_layer)
     
+    # --- NEW FEATURE: Add Pulsing Target Marker if coordinates are set ---
+    if st.session_state.target_lat and st.session_state.target_lon:
+        target_popup = f"""
+        <div style="font-family: Arial; width: 250px;">
+            <h4 style="color: #ff0000; margin: 0;">🎯 TARGET LOCATION</h4>
+            <hr>
+            <b>Lat:</b> {st.session_state.target_lat:.6f}<br>
+            <b>Lon:</b> {st.session_state.target_lon:.6f}<br>
+            <i>Street-level precision active</i>
+        </div>
+        """
+        target_icon = folium.DivIcon(
+            html="""
+            <div style="position: relative; width: 30px; height: 30px;">
+                <div style="
+                    position: absolute; width: 30px; height: 30px;
+                    background: rgba(255, 0, 0, 0.4); border-radius: 50%;
+                    animation: pulse-red 1.5s infinite;
+                "></div>
+                <div style="
+                    position: absolute; top: 10px; left: 10px;
+                    width: 10px; height: 10px; background: #ff0000;
+                    border-radius: 50%; border: 2px solid white;
+                "></div>
+            </div>
+            """,
+            icon_size=(30, 30),
+            icon_anchor=(15, 15),
+        )
+        folium.Marker(
+            location=[st.session_state.target_lat, st.session_state.target_lon],
+            popup=folium.Popup(target_popup, max_width=300),
+            tooltip="🎯 Precise Target Location",
+            icon=target_icon,
+        ).add_to(m)
+    
     # Add legend
     legend_html = """
     <div style="
-        position: fixed; 
-        bottom: 30px; left: 30px; 
-        z-index: 9999;
-        background: white; 
-        padding: 15px; 
-        border-radius: 10px;
-        box-shadow: 0 4px 15px rgba(0,0,0,0.3);
-        font-size: 13px;
-        font-family: Arial;
+        position: fixed; bottom: 30px; left: 30px; z-index: 9999;
+        background: white; padding: 15px; border-radius: 10px;
+        box-shadow: 0 4px 15px rgba(0,0,0,0.3); font-size: 13px; font-family: Arial;
     ">
         <b style="font-size: 14px;">🎯 Risk Legend</b><br><br>
         <span style="color: #dc2626; font-size: 16px;">●</span> Critical (7-10)<br>
@@ -261,42 +316,19 @@ def main():
     """
     m.get_root().html.add_child(folium.Element(legend_html))
     
-    # Render map in Streamlit
+    # Render map
     st_folium(m, width=None, height=650, returned_objects=[])
     
     # Statistics section
     st.divider()
     st.subheader("📊 Zone Intelligence Summary")
-    
     col1, col2, col3 = st.columns(3)
-    
     with col1:
         st.metric("🎯 Total Incidents", len(filtered_df))
-    
     with col2:
-        avg_risk = filtered_df["risk_score"].mean()
-        st.metric("⚠️ Avg Risk Score", f"{avg_risk:.1f}/10")
-    
+        st.metric("⚠️ Avg Risk Score", f"{filtered_df['risk_score'].mean():.1f}/10")
     with col3:
-        total_loss = filtered_df["amount"].sum()
-        st.metric("💰 Total Loss", f"₹{total_loss:,.0f}")
-    
-    # Zone breakdown table
-    zone_stats = filtered_df.groupby("withdrawal_zone").agg(
-        incidents=("complaint_id", "count"),
-        avg_risk=("risk_score", "mean"),
-        total_loss=("amount", "sum"),
-    ).round(2).sort_values("incidents", ascending=False)
-    
-    st.dataframe(
-        zone_stats,
-        use_container_width=True,
-        column_config={
-            "incidents": st.column_config.NumberColumn("Incidents", format="%d"),
-            "avg_risk": st.column_config.ProgressColumn("Avg Risk", min_value=0, max_value=10, format="%.1f"),
-            "total_loss": st.column_config.NumberColumn("Total Loss (₹)", format="₹%d"),
-        }
-    )
+        st.metric("💰 Total Loss", f"₹{filtered_df['amount'].sum():,.0f}")
 
 if __name__ == "__main__":
     main()
