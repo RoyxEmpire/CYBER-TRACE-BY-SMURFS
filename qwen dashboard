@@ -1,0 +1,376 @@
+ """
+SMURF — Cybercrime Investigation Intelligence System (Professional Edition)
+------------------------------------------------------
+Enhancements:
+  - Clean session-state teardown on logout
+  - Realistic mock data and interactive module simulations
+  - Modern "Glassmorphism" cybersecurity UI theme
+  - Simulated processing delays (spinners) for realism
+"""
+
+import streamlit as st
+import hashlib
+import hmac
+import os
+import time
+import pandas as pd
+from datetime import datetime, timedelta
+
+# =====================================================
+# PAGE CONFIGURATION (Must be first Streamlit command)
+# =====================================================
+st.set_page_config(
+    page_title="SMURF | Cybercrime Investigation Intelligence System",
+    page_icon="🛡️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# =====================================================
+# CONSTANTS
+# =====================================================
+MAX_LOGIN_ATTEMPTS = 5
+LOCKOUT_SECONDS = 60
+
+# =====================================================
+# AUTHENTICATION & SECURITY
+# =====================================================
+def _make_demo_user(password: str, salt: bytes | None = None) -> dict:
+    """Create a {salt, hash} record using PBKDF2-HMAC-SHA256."""
+    salt = salt or os.urandom(16)
+    pwd_hash = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000)
+    return {"salt": salt, "hash": pwd_hash}
+
+# Demo credentials (Replace with DB lookup in production)
+USERS = {
+    "admin": _make_demo_user("SMURF@123", salt=b"static-demo-salt-1"),
+    "officer": _make_demo_user("Police@123", salt=b"static-demo-salt-2"),
+}
+
+def check_password(username: str, password: str) -> bool:
+    """Constant-time password verification."""
+    record = USERS.get(username)
+    if record is None:
+        # Decoy hash to prevent timing attacks revealing valid usernames
+        hashlib.pbkdf2_hmac("sha256", password.encode(), b"decoy-salt", 200_000)
+        return False
+    candidate = hashlib.pbkdf2_hmac("sha256", password.encode(), record["salt"], 200_000)
+    return hmac.compare_digest(candidate, record["hash"])
+
+# =====================================================
+# SESSION STATE MANAGEMENT
+# =====================================================
+def init_session_state():
+    defaults = {
+        "authenticated": False,
+        "username": None,
+        "login_attempts": 0,
+        "lockout_until": 0.0,
+        "active_module": "overview",
+        "last_login": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+def logout():
+    """Cleanly tear down authentication state."""
+    auth_keys = ["authenticated", "username", "login_attempts", "lockout_until", "last_login"]
+    for key in auth_keys:
+        if key in st.session_state:
+            del st.session_state[key]
+    st.session_state["active_module"] = "overview"
+    st.rerun()
+
+# =====================================================
+# STYLING (Cybersecurity Glassmorphism Theme)
+# =====================================================
+def inject_css():
+    st.markdown(
+        """
+        <style>
+        /* Hide default Streamlit clutter */
+        #MainMenu, footer, header {visibility: hidden;}
+        
+        /* Global Background */
+        .stApp {
+            background: radial-gradient(circle at top right, #1a233a 0%, #0b1220 100%);
+            color: #e2e8f0;
+        }
+        
+        /* Card Styling */
+        .smurf-card {
+            background: rgba(30, 41, 59, 0.7);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(148, 163, 184, 0.1);
+            border-radius: 16px;
+            padding: 2rem;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+        }
+
+        /* Sidebar Styling */
+        section[data-testid="stSidebar"] {
+            background: rgba(15, 23, 42, 0.95) !important;
+            border-right: 1px solid rgba(148, 163, 184, 0.1);
+        }
+        
+        /* Buttons */
+        .stButton > button {
+            background: linear-gradient(90deg, #0ea5e9 0%, #2563eb 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+        .stButton > button:hover {
+            box-shadow: 0 0 15px rgba(14, 165, 233, 0.5);
+            transform: translateY(-1px);
+        }
+        
+        /* Dataframes */
+        .dataframe {
+            background: rgba(30, 41, 59, 0.5) !important;
+            color: #e2e8f0 !important;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        
+        /* Badges */
+        .smurf-badge {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 999px;
+            background: rgba(14, 165, 233, 0.15);
+            color: #38bdf8;
+            font-size: 0.75rem;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            font-weight: 700;
+            border: 1px solid rgba(56, 189, 248, 0.3);
+            margin-bottom: 1rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# =====================================================
+# MOCK DATA GENERATORS (Cached for performance)
+# =====================================================
+@st.cache_data
+def get_mock_transactions():
+    return pd.DataFrame({
+        "Case ID": ["C-9021", "C-9022", "C-9024", "C-9025"],
+        "Suspect Wallet": ["0x7a2...9f1", "0x3b8...2c4", "0x9d1...4a7", "0x1c5...8e2"],
+        "Amount (USD)": [15400.00, 8200.50, 45000.00, 3100.00],
+        "Risk Score": [85, 42, 98, 65],
+        "Status": ["🔴 High", "🟡 Medium", "🔴 High", "🟡 Medium"]
+    })
+
+@st.cache_data
+def get_mock_evidence():
+    return pd.DataFrame({
+        "Evidence ID": ["EV-001", "EV-002", "EV-003"],
+        "Type": ["Screenshot", "Bank Record", "IP Log"],
+        "Case Link": ["C-9021", "C-9024", "C-9022"],
+        "Custody Officer": ["Det. Smith", "Ofc. Jones", "Det. Smith"],
+        "Date Logged": ["2023-10-24", "2023-10-25", "2023-10-26"]
+    })
+
+# =====================================================
+# LOGIN PAGE
+# =====================================================
+def login_page():
+    inject_css()
+    _, center, _ = st.columns([1, 1.5, 1])
+
+    with center:
+        st.markdown('<div class="smurf-card">', unsafe_allow_html=True)
+        st.markdown('<div class="smurf-badge">Restricted Access</div>', unsafe_allow_html=True)
+        st.title("🛡️ SMURF")
+        st.subheader("Cybercrime Investigation Intelligence System")
+        st.caption("Authorized personnel only. All access attempts are cryptographically logged.")
+        st.divider()
+
+        now = time.time()
+        locked_out = now < st.session_state.get("lockout_until", 0.0)
+
+        if locked_out:
+            remaining = int(st.session_state["lockout_until"] - now)
+            st.error(f"⛔ Account temporarily locked. Try again in {remaining} seconds.")
+            st.progress((LOCKOUT_SECONDS - remaining) / LOCKOUT_SECONDS)
+        else:
+            with st.form("login_form", clear_on_submit=False):
+                username = st.text_input("Officer ID", placeholder="e.g., admin")
+                password = st.text_input("Password", type="password", placeholder="••••••••")
+                submitted = st.form_submit_button("🔑 Secure Login", use_container_width=True)
+
+            if submitted:
+                if not username or not password:
+                    st.warning("Please enter both Officer ID and Password.")
+                elif check_password(username, password):
+                    st.session_state["authenticated"] = True
+                    st.session_state["username"] = username
+                    st.session_state["login_attempts"] = 0
+                    st.session_state["last_login"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    st.rerun()
+                else:
+                    st.session_state["login_attempts"] += 1
+                    remaining_tries = MAX_LOGIN_ATTEMPTS - st.session_state["login_attempts"]
+                    
+                    if remaining_tries <= 0:
+                        st.session_state["lockout_until"] = now + LOCKOUT_SECONDS
+                        st.session_state["login_attempts"] = 0
+                        st.error("⛔ Maximum attempts reached. Account locked for 60 seconds.")
+                        st.rerun()
+                    else:
+                        st.error(f"Invalid credentials. {remaining_tries} attempt(s) remaining.")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+
+# =====================================================
+# DASHBOARD & MODULES
+# =====================================================
+def sidebar_nav():
+    with st.sidebar:
+        st.markdown("### 🛡️ SMURF")
+        st.caption(f"👤 **{st.session_state['username'].upper()}**")
+        st.caption(f"🕒 Last Login: {st.session_state.get('last_login', 'N/A')}")
+        st.divider()
+        
+        modules = [
+            ("overview", "🏠 Overview"),
+            ("qr_url", "🔎 QR / URL Analyzer"),
+            ("withdrawal", "📍 Withdrawal Zones"),
+            ("network", "🕸️ Transaction Network"),
+            ("evidence", "📁 Evidence Management"),
+        ]
+        
+        for key, label in modules:
+            if st.button(label, use_container_width=True, type="primary" if st.session_state["active_module"] == key else "secondary"):
+                st.session_state["active_module"] = key
+                st.rerun()
+                
+        st.divider()
+        if st.button("🚪 Logout", use_container_width=True, type="primary"):
+            logout()
+
+def render_overview():
+    st.subheader("📊 Operational Overview")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Active Cases", "24", "+3 this week")
+    col2.metric("Connected Nodes", "118", "+12 new")
+    col3.metric("High-Risk Alerts", "7", "-2 resolved")
+    col4.metric("Evidence Items", "342", "+15 today")
+    
+    st.divider()
+    st.markdown("#### 📝 Recent System Activity")
+    st.dataframe(pd.DataFrame({
+        "Timestamp": ["10:42 AM", "10:15 AM", "09:30 AM"],
+        "User": ["admin", "officer", "admin"],
+        "Action": ["Generated Network Graph for C-9024", "Uploaded Bank Record EV-002", "Flagged URL as Phishing"],
+        "IP Address": ["192.168.1.10", "192.168.1.45", "192.168.1.10"]
+    }), use_container_width=True, hide_index=True)
+
+def render_qr_url():
+    st.subheader("🔎 Scam QR / URL Analyzer")
+    st.markdown("Enter a suspicious URL or upload a QR code image to analyze threat indicators.")
+    
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        target_url = st.text_input("Target URL", placeholder="https://suspicious-verify-account.com")
+    with col2:
+        st.file_uploader("Or Upload QR Image", type=["png", "jpg", "jpeg"])
+        
+    if st.button("🔍 Analyze Threat", type="primary"):
+        if target_url:
+            with st.spinner("Querying threat intelligence databases..."):
+                time.sleep(1.5) # Simulate API call
+            st.success("Analysis Complete")
+            st.dataframe(pd.DataFrame({
+                "Indicator": ["Domain Age", "SSL Certificate", "Blacklist Status", "Phishing Heuristics"],
+                "Value": ["3 days", "Self-signed (Invalid)", "Listed on PhishTank", "Score: 92/100 (Critical)"],
+                "Risk": ["🔴 High", "🔴 High", "🔴 High", "🔴 High"]
+            }), use_container_width=True, hide_index=True)
+        else:
+            st.warning("Please enter a URL to analyze.")
+
+def render_withdrawal():
+    st.subheader("📍 Withdrawal Zone Prediction")
+    st.markdown("Geospatial analysis of historical cash-out points linked to current suspects.")
+    
+    # Simulated chart data
+    chart_data = pd.DataFrame({
+        "Zone": ["Zone A (Downtown)", "Zone B (Mall)", "Zone C (Airport)", "Zone D (Suburbs)"],
+        "Incidents": [45, 28, 12, 8],
+        "Avg Amount": [12000, 5000, 25000, 3000]
+    }).set_index("Zone")
+    
+    st.bar_chart(chart_data["Incidents"], color="#0ea5e9")
+    st.caption("📈 Figure 1: Frequency of withdrawal incidents by geospatial zone.")
+
+def render_network():
+    st.subheader("🕸️ Transaction Network Analysis")
+    st.markdown("Visualizing fund flows between flagged entities.")
+    
+    df = get_mock_transactions()
+    st.dataframe(
+        df.style.applymap(
+            lambda v: "color: #ef4444; font-weight: bold" if "High" in v else "color: #eab308",
+            subset=["Status"]
+        ),
+        use_container_width=True,
+        hide_index=True
+    )
+    st.info("💡 *Tip: Click on a Case ID to expand the full node graph (Integration pending).*")
+
+def render_evidence():
+    st.subheader("📁 Evidence Management & Chain of Custody")
+    
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        st.markdown("#### Upload New Evidence")
+        uploaded = st.file_uploader("Select File", type=["pdf", "png", "jpg", "csv"])
+        case_link = st.selectbox("Link to Case", ["C-9021", "C-9022", "C-9024", "C-9025"])
+        if st.button("Upload & Log", type="primary"):
+            if uploaded:
+                st.success(f"✅ {uploaded.name} logged to {case_link}")
+            else:
+                st.warning("Please select a file first.")
+                
+    with col2:
+        st.markdown("#### Recent Chain of Custody")
+        st.dataframe(get_mock_evidence(), use_container_width=True, hide_index=True)
+
+# =====================================================
+# APPLICATION ENTRY POINT
+# =====================================================
+def main():
+    init_session_state()
+    inject_css()
+    
+    if st.session_state.get("authenticated"):
+        sidebar_nav()
+        
+        # Main Content Area
+        st.markdown('<div style="padding: 1rem;">', unsafe_allow_html=True)
+        
+        active = st.session_state["active_module"]
+        if active == "overview":
+            render_overview()
+        elif active == "qr_url":
+            render_qr_url()
+        elif active == "withdrawal":
+            render_withdrawal()
+        elif active == "network":
+            render_network()
+        elif active == "evidence":
+            render_evidence()
+            
+        st.markdown('</div>', unsafe_allow_html=True)
+    else:
+        login_page()
+
+if __name__ == "__main__":
+    main()
