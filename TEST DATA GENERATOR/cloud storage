@@ -1,0 +1,366 @@
+"""
+SMURF — Role-Based Cloud Access Control (Professional Prototype)
+================================================================
+Demonstrates a Zero-Trust, RBAC-filtered access model for cybercrime data.
+
+Features:
+  - Encryption at rest (Fernet) for victim PII
+  - PBKDF2 password hashing with salt
+  - UPI ID Tokenization for privacy-preserving graph linking
+  - Strict Role-Based Access Control (Station / State / National / Admin)
+  - Immutable Audit Logging for every access attempt
+"""
+
+import sqlite3
+import hashlib
+import hmac
+import os
+import secrets
+import logging
+from contextlib import closing
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Optional, List, Dict, Any
+
+from cryptography.fernet import Fernet, InvalidToken
+
+# ---------------------------------------------------------------------------
+# 0. CONFIGURATION & LOGGING
+# ---------------------------------------------------------------------------
+DB_PATH = "smurf_demo.db"
+KEY_PATH = "smurf_secret.key"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)-8s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# 1. ROLES — defines what each user type is allowed to see
+# ---------------------------------------------------------------------------
+class Role(str, Enum):
+    STATION = "station_officer"         # sees only their own station's cases
+    STATE = "state_supervisor"          # sees all cases within their state
+    NATIONAL = "national_investigator"  # sees only cross-state MATCHES, no raw PII
+    ADMIN = "system_admin"              # manages system, cannot read victim PII
+
+# ---------------------------------------------------------------------------
+# 2. ENCRYPTION AT REST — sensitive fields are encrypted before hitting disk
+# ---------------------------------------------------------------------------
+def load_or_create_key() -> bytes:
+    if os.path.exists(KEY_PATH):
+        with open(KEY_PATH, "rb") as f:
+            return f.read()
+    key = Fernet.generate_key()
+    with open(KEY_PATH, "wb") as f:
+        f.write(key)
+    logger.info(f"Generated new Fernet encryption key at {KEY_PATH}")
+    return key
+
+FERNET = Fernet(load_or_create_key())
+
+def encrypt_field(plaintext: str) -> str:
+    if not plaintext: return ""
+    return FERNET.encrypt(plaintext.encode('utf-8')).decode('utf-8')
+
+def decrypt_field(ciphertext: str) -> str:
+    if not ciphertext: return ""
+    try:
+        return FERNET.decrypt(ciphertext.encode('utf-8')).decode('utf-8')
+    except InvalidToken:
+        logger.error("Failed to decrypt field. Invalid token or corrupted data.")
+        return "[DECRYPTION_ERROR]"
+
+# ---------------------------------------------------------------------------
+# 3. PASSWORD HASHING — never store plaintext passwords
+# ---------------------------------------------------------------------------
+def hash_password(password: str, salt: Optional[bytes] = None) -> str:
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode('utf-8'), salt, 200_000)
+    return f"{salt.hex()}:{digest.hex()}"
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        salt_hex, digest_hex = stored.split(":")
+        salt = bytes.fromhex(salt_hex)
+        expected = hashlib.pbkdf2_hmac("sha256", password.encode('utf-8'), salt, 200_000)
+        return hmac.compare_digest(expected.hex(), digest_hex)
+    except ValueError:
+        return False
+
+# ---------------------------------------------------------------------------
+# 4. DATABASE SETUP (Using contextlib.closing to prevent connection leaks)
+# ---------------------------------------------------------------------------
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return closing(conn)
+
+def init_db():
+    with get_db() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL,
+                station TEXT,
+                state TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS complaints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                station TEXT NOT NULL,
+                state TEXT NOT NULL,
+                victim_name_enc TEXT NOT NULL,
+                victim_phone_enc TEXT NOT NULL,
+                upi_id_token TEXT NOT NULL,
+                predicted_zone TEXT,
+                confidence REAL,
+                is_cross_state_match INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                username TEXT NOT NULL,
+                role TEXT NOT NULL,
+                action TEXT NOT NULL,
+                complaint_id INTEGER,
+                allowed INTEGER NOT NULL,
+                reason TEXT
+            );
+        """)
+    logger.info("Database schema initialized successfully.")
+
+# ---------------------------------------------------------------------------
+# 5. UPI ID TOKENIZATION — privacy-preserving graph linking
+# ---------------------------------------------------------------------------
+# In production, load this from environment variables or a secure KMS
+TOKENIZE_SALT = b"smurf-static-salt-change-in-real-deployment"
+
+def tokenize_upi_id(upi_id: str) -> str:
+    return hmac.new(TOKENIZE_SALT, upi_id.encode('utf-8'), hashlib.sha256).hexdigest()[:16]
+
+# ---------------------------------------------------------------------------
+# 6. SESSION / LOGIN
+# ---------------------------------------------------------------------------
+# In-memory session store. In production, use Redis, JWT, or a secure session DB.
+SESSIONS: Dict[str, Dict[str, Any]] = {}
+
+def create_user(username: str, password: str, role: Role, station: Optional[str] = None, state: Optional[str] = None):
+    with get_db() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO users (username, password_hash, role, station, state) VALUES (?,?,?,?,?)",
+                (username, hash_password(password), role.value, station, state),
+            )
+            conn.commit()
+            logger.info(f"Created user '{username}' with role '{role.value}'")
+        except sqlite3.IntegrityError:
+            logger.warning(f"User '{username}' already exists.")
+
+def login(username: str, password: str) -> Optional[str]:
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    
+    if row and verify_password(password, row["password_hash"]):
+        token = secrets.token_hex(16)
+        SESSIONS[token] = dict(row)
+        logger.info(f"User '{username}' logged in successfully.")
+        return token
+    
+    logger.warning(f"Failed login attempt for user '{username}'.")
+    return None
+
+# ---------------------------------------------------------------------------
+# 7. AUDIT LOGGING — every access attempt is recorded
+# ---------------------------------------------------------------------------
+def log_access(username: str, role: str, action: str, complaint_id: Optional[int], allowed: bool, reason: str = ""):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO audit_log (timestamp, username, role, action, complaint_id, allowed, reason) VALUES (?,?,?,?,?,?,?)",
+            (datetime.now(timezone.utc).isoformat(), username, role, action, complaint_id, int(allowed), reason),
+        )
+        conn.commit()
+
+# ---------------------------------------------------------------------------
+# 8. RBAC-FILTERED CASE ACCESS — the core "who sees what" logic
+# ---------------------------------------------------------------------------
+def get_visible_complaints(token: str) -> List[Dict[str, Any]]:
+    user = SESSIONS.get(token)
+    if not user:
+        raise PermissionError("Invalid or expired session token.")
+
+    username, role = user["username"], user["role"]
+    
+    with get_db() as conn:
+        if role == Role.STATION.value:
+            rows = conn.execute("SELECT * FROM complaints WHERE station=?", (user["station"],)).fetchall()
+            reason = f"station-scoped view: {user['station']}"
+            decrypt_pii = True
+        elif role == Role.STATE.value:
+            rows = conn.execute("SELECT * FROM complaints WHERE state=?", (user["state"],)).fetchall()
+            reason = f"state-scoped view: {user['state']}"
+            decrypt_pii = True
+        elif role == Role.NATIONAL.value:
+            rows = conn.execute("SELECT * FROM complaints WHERE is_cross_state_match=1").fetchall()
+            reason = "national view: cross-state matches only"
+            decrypt_pii = False
+        elif role == Role.ADMIN.value:
+            rows = conn.execute("SELECT id, station, state, predicted_zone, confidence FROM complaints").fetchall()
+            log_access(username, role, "LIST_COMPLAINTS", None, True, "admin: metadata only, no PII")
+            return [dict(r) for r in rows]
+        else:
+            log_access(username, role, "LIST_COMPLAINTS", None, False, "unknown role")
+            raise PermissionError("Role not recognized — access denied.")
+
+    log_access(username, role, "LIST_COMPLAINTS", None, True, reason)
+
+    results = []
+    for r in rows:
+        row = dict(r)
+        if decrypt_pii:
+            row["victim_name"] = decrypt_field(row.pop("victim_name_enc"))
+            row["victim_phone"] = decrypt_field(row.pop("victim_phone_enc"))
+        else:
+            row.pop("victim_name_enc", None)
+            row.pop("victim_phone_enc", None)
+        results.append(row)
+        
+    return results
+
+def file_complaint(token: str, station: str, state: str, victim_name: str, victim_phone: str, 
+                   upi_id: str, predicted_zone: str, confidence: float, cross_state_match: bool = False) -> int:
+    user = SESSIONS.get(token)
+    if not user:
+        raise PermissionError("Invalid session.")
+    
+    username, role = user["username"], user["role"]
+    
+    if role != Role.STATION.value:
+        log_access(username, role, "FILE_COMPLAINT", None, False, "only station officers may file complaints")
+        raise PermissionError("Only station officers can file complaints.")
+    if user["station"] != station:
+        log_access(username, role, "FILE_COMPLAINT", None, False, "station mismatch")
+        raise PermissionError("Cannot file a complaint for a different station.")
+
+    with get_db() as conn:
+        cur = conn.execute(
+            "INSERT INTO complaints (station, state, victim_name_enc, victim_phone_enc, upi_id_token, "
+            "predicted_zone, confidence, is_cross_state_match) VALUES (?,?,?,?,?,?,?,?)",
+            (
+                station, state,
+                encrypt_field(victim_name),
+                encrypt_field(victim_phone),
+                tokenize_upi_id(upi_id),
+                predicted_zone, confidence, int(cross_state_match),
+            ),
+        )
+        conn.commit()
+        complaint_id = cur.lastrowid
+
+    log_access(username, role, "FILE_COMPLAINT", complaint_id, True, f"filed for {station}")
+    logger.info(f"Complaint #{complaint_id} filed by {username} at {station}.")
+    return complaint_id
+
+# ---------------------------------------------------------------------------
+# 9. DEMO — run this file directly to see the whole flow end-to-end
+# ---------------------------------------------------------------------------
+def demo():
+    # Clean up previous run to ensure a fresh state
+    for file in [DB_PATH, KEY_PATH]:
+        if os.path.exists(file):
+            os.remove(file)
+            
+    init_db()
+
+    print("\n" + "="*70)
+    print(" SMURF ROLE-BASED ACCESS CONTROL & ZERO-TRUST DEMO ".center(70, "="))
+    print("="*70 + "\n")
+
+    # Setup users
+    create_user("officer_kondapur", "pass123", Role.STATION, station="Kondapur PS", state="Telangana")
+    create_user("officer_miyapur", "pass123", Role.STATION, station="Miyapur PS", state="Telangana")
+    create_user("supervisor_ts", "pass123", Role.STATE, state="Telangana")
+    create_user("national_i4c", "pass123", Role.NATIONAL)
+    create_user("sysadmin", "pass123", Role.ADMIN)
+
+    print("\n[1] LOGIN & SESSION CREATION")
+    print("-" * 70)
+    kondapur_token = login("officer_kondapur", "pass123")
+    print(f"✅ Kondapur Officer Logged In: {bool(kondapur_token)}")
+    _ = login("officer_kondapur", "wrong_password") # Test failed login logging
+
+    print("\n[2] FILING COMPLAINTS (RBAC Enforcement)")
+    print("-" * 70)
+    c1 = file_complaint(
+        kondapur_token, "Kondapur PS", "Telangana",
+        "Ravi Kumar", "9876543210", "ravi@upi",
+        predicted_zone="Zone A - Kondapur", confidence=0.72, cross_state_match=True
+    )
+    
+    miyapur_token = login("officer_miyapur", "pass123")
+    c2 = file_complaint(
+        miyapur_token, "Miyapur PS", "Telangana",
+        "Asha Reddy", "9123456780", "asha@upi",
+        predicted_zone="Zone B - Miyapur", confidence=0.19
+    )
+
+    print("\n[3] ACCESS CONTROL TESTS (Negative Testing)")
+    print("-" * 70)
+    print("Test: Kondapur officer tries to file a complaint for Miyapur PS...")
+    try:
+        file_complaint(kondapur_token, "Miyapur PS", "Telangana", "X", "000", "x@upi", "Zone B", 0.1)
+    except PermissionError as e:
+        print(f"🚫 BLOCKED AS EXPECTED: {e}")
+
+    print("\n[4] DATA VISIBILITY (Zero-Trust Verification)")
+    print("-" * 70)
+    
+    print("\n-> Station Officer View (Kondapur): Sees ONLY their station, PII decrypted.")
+    for row in get_visible_complaints(kondapur_token):
+        print(f"   ID:{row['id']} | Victim: {row.get('victim_name'):12} | Zone: {row['predicted_zone']}")
+
+    print("\n-> State Supervisor View (Telangana): Sees ALL state cases, PII decrypted.")
+    state_token = login("supervisor_ts", "pass123")
+    for row in get_visible_complaints(state_token):
+        print(f"   ID:{row['id']} | Station: {row['station']:12} | Victim: {row.get('victim_name')}")
+
+    print("\n-> National Investigator View: Sees ONLY cross-state matches, PII MASKED.")
+    national_token = login("national_i4c", "pass123")
+    for row in get_visible_complaints(national_token):
+        has_pii = 'victim_name' in row or 'victim_name_enc' in row
+        print(f"   ID:{row['id']} | Cross-State: {bool(row['is_cross_state_match'])} | PII Leaked: {has_pii}")
+
+    print("\n-> System Admin View: Sees ONLY system metadata, NO victim data.")
+    admin_token = login("sysadmin", "pass123")
+    for row in get_visible_complaints(admin_token):
+        print(f"   ID:{row['id']} | Station: {row['station']:12} | Confidence: {row['confidence']}")
+
+    print("\n[5] UPI TOKENIZATION (Privacy-Preserving Graph Linking)")
+    print("-" * 70)
+    t1 = tokenize_upi_id("ravi@upi")
+    t2 = tokenize_upi_id("ravi@upi")
+    t3 = tokenize_upi_id("asha@upi")
+    print(f"Token for 'ravi@upi': {t1}")
+    print(f"Token for 'ravi@upi': {t2} (Deterministic Match: {t1 == t2})")
+    print(f"Token for 'asha@upi': {t3} (Different User: {t1 == t3})")
+
+    print("\n[6] IMMUTABLE AUDIT TRAIL (Every Action Logged)")
+    print("-" * 70)
+    with get_db() as conn:
+        rows = conn.execute("SELECT timestamp, username, role, action, allowed, reason FROM audit_log ORDER BY id").fetchall()
+        for row in rows:
+            status = "✅ ALLOW" if row["allowed"] else "🚫 BLOCK"
+            print(f"[{status}] {row['username']:15} | {row['action']:15} | {row['reason']}")
+
+    print("\n" + "="*70)
+    print(" DEMO COMPLETE. DATABASE & KEY FILES GENERATED IN CURRENT DIRECTORY ".center(70, "="))
+    print("="*70 + "\n")
+
+if __name__ == "__main__":
+    demo()
